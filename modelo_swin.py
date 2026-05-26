@@ -9,22 +9,9 @@ import torch.optim as optim
 from collections import Counter
 import numpy as np
 from sklearn.metrics import classification_report, f1_score
+from torch.utils.data import WeightedRandomSampler
+from utils import device, BINARY_MAP, CitologiaDataset, TARGET_NAMES
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-
-# ─── Dataset ──────────────────────────────────────────────────────────────────
-
-class CitologiaDataset(data.Dataset):
-    def __init__(self, original_dataset, binary_map):
-        self.original_dataset = original_dataset
-        self.binary_map = binary_map
-
-    def __len__(self):
-        return len(self.original_dataset)
-
-    def __getitem__(self, idx):
-        img, label = self.original_dataset[idx]
-        return img, self.binary_map[label]
 
 # ─── Transforms ───────────────────────────────────────────────────────────────
 # Swin espera 224×224, igual que ResNet50, sin cambios aquí
@@ -38,16 +25,16 @@ train_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
+
 val_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
-
 train_dataset = datasets.ImageFolder(root='dataset/entrenamiento', transform=train_transform)
 val_dataset   = datasets.ImageFolder(root='dataset/entrenamiento', transform=val_transform)
 
-binary_map = {0: 1, 1: 1, 2: 1, 3: 0}  # benigna=0, resto=1
+binary_map = BINARY_MAP  # benigna=0, resto=1
 train_binary_dataset = CitologiaDataset(train_dataset, binary_map)
 val_binary_dataset   = CitologiaDataset(val_dataset, binary_map)
 
@@ -68,8 +55,8 @@ val_split   = data.Subset(val_binary_dataset,   val_idx)
 swin = models.swin_t(weights=models.Swin_T_Weights.IMAGENET1K_V1)
 
 # La cabeza original es swin.head (Linear 768→1000)
-# La sustituimos por nuestro clasificador binario
-swin.head = nn.Linear(768, 2)
+# La sustituimos por nuestro clasificador binario (2) O CUATERNARIO (4)
+swin.head = nn.Linear(768, 4)
 
 # Estrategia de congelado:
 #   - Congela patch_embed + primeras 2 stages (stages 0 y 1)
@@ -118,21 +105,30 @@ optimizer = optim.AdamW([
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-7)
 
 # ─── Loss con pesos de clase ───────────────────────────────────────────────────
-
+'''
 counts = Counter(binary_targets)
 weight_benign    = (counts[0] + counts[1]) / (2 * counts[0])
 weight_malignant = (counts[0] + counts[1]) / (2 * counts[1])
-weight_tensor = torch.tensor([weight_benign, weight_malignant]).float().to(device)
+weight_tensor = torch.tensor([weight_benign, weight_malignant]).float().to(device) CLASIFICACION BINARIA
+'''
+
+counts = Counter(binary_targets)
+total = sum(counts.values())
+weights = [total / (4 * counts[i]) for i in range(4)]
+weight_tensor = torch.tensor(weights).float().to(device)
 
 criterion = nn.CrossEntropyLoss(weight=weight_tensor)
 
 # ─── Entrenamiento ─────────────────────────────────────────────────────────────
 
-EPOCHS      = 25
+EPOCHS      = 100
 BATCH       = 32
-NUM_WORKERS = 0  # 4 en idun
+NUM_WORKERS = 4  # 4 en idun
 
-train_loader = data.DataLoader(train_split, shuffle=True,  num_workers=NUM_WORKERS, batch_size=BATCH)
+train_targets = [binary_targets[i] for i in train_idx]
+sample_weights = [1.0 / counts[train_targets[i]] for i in range(len(train_idx))]
+sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+train_loader = data.DataLoader(train_split, sampler=sampler, num_workers=NUM_WORKERS, batch_size=BATCH)
 val_loader   = data.DataLoader(val_split,   shuffle=False, num_workers=NUM_WORKERS, batch_size=BATCH)
 
 best_f1 = 0.0
@@ -168,11 +164,12 @@ for epoch in range(EPOCHS):
     preds_flat  = np.concatenate(preds)
     labels_flat = np.concatenate(labels)
 
-    f1 = f1_score(labels_flat, preds_flat, pos_label=1)
+   # f1 = f1_score(labels_flat, preds_flat, pos_label=1) BINARIA
+    f1 = f1_score(labels_flat, preds_flat, average='macro')
     if f1 > best_f1:
         best_f1 = f1
-        torch.save(swin.state_dict(), 'best_swin.pth')
-        print(f"  ✓ Nuevo mejor F1: {best_f1:.4f} — modelo guardado")
+        torch.save(swin.state_dict(), 'best_swin_4class.pth')
+        print(f" Nuevo mejor F1: {best_f1:.4f} — modelo guardado")
 
     print(f"Epoch {epoch+1}/{EPOCHS} — Val Acc: {np.mean(preds_flat == labels_flat):.3f}")
-    print(classification_report(labels_flat, preds_flat, target_names=['benign', 'cancer']))
+    print(classification_report(labels_flat, preds_flat, target_names=TARGET_NAMES))
